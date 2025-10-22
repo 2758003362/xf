@@ -1,0 +1,296 @@
+name: 达梦API服务打包（包含加密库）
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 检出仓库代码
+        uses: actions/checkout@v4
+
+      - name: 配置静态Python环境（兼容GLIBC 2.31）
+        run: |
+          wget https://github.com/astral-sh/python-build-standalone/releases/download/20240224/cpython-3.11.8+20240224-x86_64-unknown-linux-gnu-install_only.tar.gz
+          
+          if [ ! -f "cpython-3.11.8+20240224-x86_64-unknown-linux-gnu-install_only.tar.gz" ]; then
+            echo "错误：Python压缩包下载失败"
+            exit 1
+          fi
+          
+          mkdir -p python
+          tar -xzf cpython-3.11.8+20240224-x86_64-unknown-linux-gnu-install_only.tar.gz -C python --strip-components=1
+          
+          if [ ! -f "./python/bin/python" ]; then
+            echo "错误：Python解压失败"
+            exit 1
+          fi
+          echo "✅ 静态Python配置完成，版本：$(./python/bin/python --version)"
+
+      - name: 验证达梦加密库（仓库dm_libs/目录）
+        run: |
+          echo "开始验证仓库中的达梦加密库..."
+          
+          # 检查dm_libs/目录是否存在（核心修改：适配实际目录名）
+          if [ ! -d "./dm_libs" ]; then
+            echo "错误：仓库中未找到dm_libs/目录，请确认目录名称正确"
+            exit 1
+          fi
+          
+          # 定义需要的加密库文件列表（根据你的实际文件调整）
+          REQUIRED_LIBS=(
+            "libcryptocme.so"
+            "libdmcrypt.so"
+            "libdmdpi.so"
+            "libdmgmssl.so"
+          )
+          
+          # 检查每个库文件是否存在
+          missing_libs=()
+          for lib in "${REQUIRED_LIBS[@]}"; do
+            if [ ! -f "./dm_libs/$lib" ]; then
+              missing_libs+=("$lib")
+            fi
+          done
+          
+          # 输出检查结果
+          if [ ${#missing_libs[@]} -ne 0 ]; then
+            echo "错误：dm_libs/目录中缺少以下加密库文件：${missing_libs[*]}"
+            exit 1
+          else
+            echo "✅ 所有必需的达梦加密库文件已找到"
+            ls -la ./dm_libs/  # 显示目录内容，确认文件存在
+          fi
+          
+          # 将库文件路径存入环境变量，供后续打包使用
+          echo "DM_LIBS_PATH=$(pwd)/dm_libs" >> $GITHUB_ENV
+
+      - name: 安装libaio1并获取低版本libstdc++/libgcc_s
+        run: |
+          # 1. 安装libaio1
+          echo "使用apt安装libaio1..."
+          sudo apt-get update -qq
+          sudo apt-get install -y libaio1
+          
+          # 验证安装结果
+          if ! dpkg -s libaio1 &> /dev/null; then
+            echo "错误：libaio1安装失败"
+            exit 1
+          fi
+          
+          LIB_AIO_PATH=$(ldconfig -p | grep "libaio.so.1" | head -n 1 | awk '{print $4}' | tr -d '\n\r')
+          echo "LIB_AIO_PATH=$LIB_AIO_PATH" >> $GITHUB_ENV
+          
+          # 2. 下载Ubuntu 20.04的libstdc++6包
+          echo "下载Ubuntu 20.04的libstdc++6包..."
+          stdcxx_urls=(
+            "http://security.ubuntu.com/ubuntu/pool/main/g/gcc-10/libstdc++6_10.5.0-1ubuntu1~20.04_amd64.deb"
+            "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/pool/main/g/gcc-10/libstdc++6_10.5.0-1ubuntu1~20.04_amd64.deb"
+            "http://archive.ubuntu.com/ubuntu/pool/main/g/gcc-10/libstdc++6_10.5.0-1ubuntu1~20.04_amd64.deb"
+            "http://security.ubuntu.com/ubuntu/pool/main/g/gcc-10/libstdc++6_10-20200411-0ubuntu1_amd64.deb"
+          )
+          
+          stdcxx_download_success=false
+          for url in "${stdcxx_urls[@]}"; do
+            echo "尝试从 $url 下载libstdc++6..."
+            if wget -q "$url" -O libstdc++6.deb; then
+              if dpkg-deb -I libstdc++6.deb &> /dev/null; then
+                stdcxx_download_success=true
+                echo "✅ 下载成功: $(basename $url)"
+                break
+              else
+                echo "下载的文件损坏，尝试下一个源..."
+                rm -f libstdc++6.deb
+              fi
+            else
+              echo "下载失败，尝试下一个源..."
+            fi
+          done
+          
+          if [ "$stdcxx_download_success" = false ]; then
+            echo "错误：所有libstdc++下载源均失败"
+            SYSTEM_LIBSTDCPP_PATH=$(ldconfig -p | grep "libstdc++.so.6" | head -n 1 | awk '{print $4}')
+            if [ -n "$SYSTEM_LIBSTDCPP_PATH" ]; then
+              cp "$SYSTEM_LIBSTDCPP_PATH" ./libstdc++.so.6
+              echo "LOW_GLIBC_LIBSTDCPP_PATH=./libstdc++.so.6" >> $GITHUB_ENV
+              echo "✅ 使用系统libstdc++.so.6作为备选方案"
+            else
+              echo "错误：无法找到可用的libstdc++.so.6"
+              exit 1
+            fi
+          else
+            mkdir -p libstdc++
+            dpkg-deb -x libstdc++6.deb libstdc++
+            LOW_GLIBC_LIBSTDCPP_PATH=$(find ./libstdc++ -name "libstdc++.so.6" | head -n 1)
+            
+            if [ -z "$LOW_GLIBC_LIBSTDCPP_PATH" ] || [ ! -f "$LOW_GLIBC_LIBSTDCPP_PATH" ]; then
+              echo "错误：未找到低版本libstdc++.so.6"
+              exit 1
+            fi
+            
+            echo "LOW_GLIBC_LIBSTDCPP_PATH=$LOW_GLIBC_LIBSTDCPP_PATH" >> $GITHUB_ENV
+            echo "✅ 低版本libstdc++准备完成: $LOW_GLIBC_LIBSTDCPP_PATH"
+          fi
+
+          # 3. 下载Ubuntu 20.04的libgcc_s1包
+          echo "下载Ubuntu 20.04的libgcc_s1包..."
+          gccs_urls=(
+            "http://security.ubuntu.com/ubuntu/pool/main/g/gcc-10/libgcc-s1_10.5.0-1ubuntu1~20.04_amd64.deb"
+            "https://mirrors.tuna.tsinghua.edu.cn/ubuntu/pool/main/g/gcc-10/libgcc-s1_10.5.0-1ubuntu1~20.04_amd64.deb"
+            "http://archive.ubuntu.com/ubuntu/pool/main/g/gcc-10/libgcc-s1_10.5.0-1ubuntu1~20.04_amd64.deb"
+            "http://security.ubuntu.com/ubuntu/pool/main/g/gcc-10/libgcc-s1_10-20200411-0ubuntu1_amd64.deb"
+          )
+          
+          gccs_download_success=false
+          for url in "${gccs_urls[@]}"; do
+            echo "尝试从 $url 下载libgcc_s1..."
+            if wget -q "$url" -O libgcc_s1.deb; then
+              if dpkg-deb -I libgcc_s1.deb &> /dev/null; then
+                gccs_download_success=true
+                echo "✅ 下载成功: $(basename $url)"
+                break
+              else
+                echo "下载的文件损坏，尝试下一个源..."
+                rm -f libgcc_s1.deb
+              fi
+            else
+              echo "下载失败，尝试下一个源..."
+            fi
+          done
+          
+          if [ "$gccs_download_success" = false ]; then
+            echo "警告：所有libgcc_s1下载源均失败，尝试使用系统自带版本"
+            SYSTEM_LIBGCC_S_PATH=$(ldconfig -p | grep "libgcc_s.so.1" | head -n 1 | awk '{print $4}')
+            if [ -n "$SYSTEM_LIBGCC_S_PATH" ]; then
+              cp "$SYSTEM_LIBGCC_S_PATH" ./libgcc_s.so.1
+              echo "LOW_GLIBC_LIBGCC_S_PATH=./libgcc_s.so.1" >> $GITHUB_ENV
+              echo "✅ 使用系统libgcc_s.so.1作为备选方案"
+            else
+              echo "错误：无法找到可用的libgcc_s.so.1"
+              exit 1
+            fi
+          else
+            mkdir -p libgcc
+            dpkg-deb -x libgcc_s1.deb libgcc
+            LOW_GLIBC_LIBGCC_S_PATH=$(find ./libgcc -name "libgcc_s.so.1" | head -n 1)
+            
+            if [ -z "$LOW_GLIBC_LIBGCC_S_PATH" ] || [ ! -f "$LOW_GLIBC_LIBGCC_S_PATH" ]; then
+              echo "错误：未找到低版本libgcc_s.so.1"
+              exit 1
+            fi
+            
+            echo "LOW_GLIBC_LIBGCC_S_PATH=$LOW_GLIBC_LIBGCC_S_PATH" >> $GITHUB_ENV
+            echo "✅ 低版本libgcc_s准备完成: $LOW_GLIBC_LIBGCC_S_PATH"
+          fi
+
+      - name: 安装Python依赖
+        run: |
+          ./python/bin/python -m pip install --upgrade pip
+          ./python/bin/python -m pip install dmPython==2.5.22 pandas==1.5.3 numpy==1.23.5 flask==2.2.3 werkzeug==2.2.3 pyinstaller==5.13.0
+          
+          # 验证依赖兼容性
+          echo "已安装的numpy版本：$(./python/bin/python -c 'import numpy; print(numpy.__version__)')"
+          echo "已安装的pandas版本：$(./python/bin/python -c 'import pandas; print(pandas.__version__)')"
+          
+          if ./python/bin/python -c "import dmPython; import pandas; import numpy" &> /dev/null; then
+            echo "✅ 所有依赖安装成功且兼容"
+          else
+            echo "错误：依赖安装或兼容性检查失败"
+            exit 1
+          fi
+
+      - name: 打包应用（包含达梦加密库）
+        run: |
+          if [ ! -f "./PythonDMService.py" ]; then
+            echo "错误：未找到入口脚本 PythonDMService.py"
+            exit 1
+          fi
+          
+          # 获取环境变量
+          LIB_AIO_PATH="${{ env.LIB_AIO_PATH }}"
+          LOW_GLIBC_LIBSTDCPP_PATH="${{ env.LOW_GLIBC_LIBSTDCPP_PATH }}"
+          LOW_GLIBC_LIBGCC_S_PATH="${{ env.LOW_GLIBC_LIBGCC_S_PATH }}"
+          DM_LIBS_PATH="${{ env.DM_LIBS_PATH }}"  # 从仓库dm_libs/目录获取加密库
+          
+          # 打包命令：添加dm_libs/目录下的所有达梦加密库
+          PYINSTALLER_CMD="./python/bin/pyinstaller --onefile --name myapp-linux \
+            --paths=./python/lib/python3.11/site-packages \
+            --hidden-import=flask \
+            --hidden-import=dmPython \
+            --hidden-import=dmPython.dbapi2 \
+            --hidden-import=pandas \
+            --hidden-import=pandas.core \
+            --hidden-import=pandas.io \
+            --collect-all numpy \
+            --collect-all pandas \
+            --add-binary=\"$LIB_AIO_PATH:.\" \
+            --add-binary=\"$LOW_GLIBC_LIBSTDCPP_PATH:.\" \
+            --add-binary=\"$LOW_GLIBC_LIBGCC_S_PATH:.\" \
+            --add-binary=\"$DM_LIBS_PATH/libcryptocme.so:.\" \
+            --add-binary=\"$DM_LIBS_PATH/libdmcrypt.so:.\" \
+            --add-binary=\"$DM_LIBS_PATH/libdmdpi.so:.\" \
+            --add-binary=\"$DM_LIBS_PATH/libdmgmssl.so:.\" \
+            ./PythonDMService.py"
+          
+          echo "执行打包命令: $PYINSTALLER_CMD"
+          eval $PYINSTALLER_CMD
+          
+          if [ ! -f "dist/myapp-linux" ]; then
+            echo "错误：打包失败"
+            exit 1
+          fi
+          
+          echo "检查最终产物的GLIBC依赖："
+          objdump -T dist/myapp-linux | grep -E "GLIBC_2.3[3-9]|GLIBC_2.[4-9][0-9]" | sort -V | head -10 || echo "✅ 未发现不兼容的高版本GLIBC依赖"
+          
+          echo "打包完成，文件信息："
+          ls -lh dist/myapp-linux
+          file dist/myapp-linux
+
+      - name: 创建启动脚本（确保库路径正确）
+        run: |
+          cat > dist/start.sh << 'EOF'
+          #!/bin/bash
+          
+          # 显式设置库路径，确保达梦加密库能被加载
+          export LD_LIBRARY_PATH=.:$LD_LIBRARY_PATH
+          
+          echo "启动达梦API服务..."
+          ./myapp-linux
+          EOF
+          
+          chmod +x dist/start.sh
+          echo "✅ 启动脚本创建完成"
+
+      - name: 保存产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: myapp-static-with-dmlibs
+          path: |
+            dist/myapp-linux
+            dist/start.sh
+          retention-days: 7
+
+  release:
+    needs: build-linux
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: 下载产物
+        uses: actions/download-artifact@v4
+        with:
+          name: myapp-static-with-dmlibs
+
+      - name: 创建Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            myapp-linux
+            start.sh
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
