@@ -1,9 +1,7 @@
 import dmPython
-import pandas as pd
 import os
 from flask import Flask, jsonify, Response, request
 import json
-from typing import List, Dict
 from datetime import datetime
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
@@ -20,8 +18,8 @@ def convert_datetime(obj):
 
 
 def get_multiple_result_sets(strSp, strParam):
-    """调用达梦存储过程（增强版：细化连接错误信息）"""
-    # 加密库检查（保留核心调试）
+    """调用达梦存储过程（兼容不同dmPython版本的错误格式）"""
+    # 加密库检查
     print("\n" + "=" * 50)
     print("【加密库加载调试】- 开始检查依赖文件")
     print(f"1. 当前运行目录：{os.getcwd()}")
@@ -44,12 +42,12 @@ def get_multiple_result_sets(strSp, strParam):
         print(error_msg)
         raise Exception(error_msg)
 
-    # 数据库连接参数（核心配置）
+    # 数据库连接参数
     conn_params = {
-        'server': '192.168.0.191',  # 数据库地址（必填）
-        'user': 'JZX',  # 用户名（必填）
-        'password': 'XFgs@345',  # 密码（必填）
-        'port': 5236,  # 端口（默认5236）
+        'server': '192.168.0.191',  # 已更新为日志中的服务器地址
+        'user': 'JZX',
+        'password': 'XFgs@345',
+        'port': 5236,
         'autoCommit': True
     }
     result_sets = []
@@ -60,15 +58,23 @@ def get_multiple_result_sets(strSp, strParam):
         print("\n【数据库操作】开始连接达梦数据库...")
         print(f"连接参数：server={conn_params['server']}, port={conn_params['port']}, user={conn_params['user']}")
 
-        # ------------ 核心增强：细化连接阶段错误捕获 ------------
+        # 连接阶段错误捕获（兼容不同dmPython版本）
         try:
-            # 尝试建立连接（此步骤最易出错，单独捕获）
             conn = dmPython.connect(**conn_params)
         except dmPython.DatabaseError as e:
-            # 达梦数据库返回的具体错误（含错误码和描述）
+            # 提取错误信息（兼容errno属性或args元组）
+            try:
+                # 尝试获取错误码（部分版本用errno）
+                error_code = e.errno
+                error_desc = e.strerror
+            except AttributeError:
+                # 若没有errno，从args提取（通常args[0]是错误码，args[1]是描述）
+                error_code = e.args[0] if len(e.args) > 0 else '未知'
+                error_desc = e.args[1] if len(e.args) > 1 else str(e)
+
             error_detail = (
-                f"达梦连接失败 [错误码: {e.errno}]\n"
-                f"错误描述: {e.strerror}\n"
+                f"达梦连接失败 [错误码: {error_code}]\n"
+                f"错误描述: {error_desc}\n"
                 f"可能原因: \n"
                 f"  1. 数据库地址/端口错误（当前：{conn_params['server']}:{conn_params['port']}\n"
                 f"  2. 用户名/密码错误（当前用户：{conn_params['user']}\n"
@@ -77,23 +83,30 @@ def get_multiple_result_sets(strSp, strParam):
             )
             print(f"❌ {error_detail}")
             raise Exception(error_detail) from e
-        # ------------------------------------------------------
 
         print("✅ 数据库连接成功（加密模块加载正常）")
         cursor = conn.cursor()
 
-        # 检查存储过程名是否为空
+        # 检查存储过程名
         if not strSp:
             raise Exception("【参数错误】存储过程名（param1）不能为空")
 
-        # 调用存储过程（确保参数为元组格式）
+        # 调用存储过程（兼容错误格式）
         print(f"调用存储过程：{strSp}，参数：{strParam}")
         try:
-            cursor.callproc(strSp, (strParam,))  # 注意参数末尾的逗号
+            cursor.callproc(strSp, (strParam,))
         except dmPython.DatabaseError as e:
+            # 同样兼容错误码提取
+            try:
+                error_code = e.errno
+                error_desc = e.strerror
+            except AttributeError:
+                error_code = e.args[0] if len(e.args) > 0 else '未知'
+                error_desc = e.args[1] if len(e.args) > 1 else str(e)
+
             error_detail = (
-                f"存储过程调用失败 [错误码: {e.errno}]\n"
-                f"错误描述: {e.strerror}\n"
+                f"存储过程调用失败 [错误码: {error_code}]\n"
+                f"错误描述: {error_desc}\n"
                 f"可能原因: \n"
                 f"  1. 存储过程 {strSp} 不存在\n"
                 f"  2. 参数 {strParam} 格式错误或不合法\n"
@@ -105,13 +118,13 @@ def get_multiple_result_sets(strSp, strParam):
         # 获取结果集
         set_index = 1
         while True:
-            if cursor.description:  # 存在结果集
+            if cursor.description:
                 columns = [col[0] for col in cursor.description]
                 rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
                 result_sets.append(rows)
                 print(f"✅ 获取结果集 {set_index}：{len(rows)} 行数据")
                 set_index += 1
-            if not cursor.nextset():  # 无更多结果集
+            if not cursor.nextset():
                 break
 
         conn.commit()
@@ -119,7 +132,6 @@ def get_multiple_result_sets(strSp, strParam):
         return result_sets
 
     except Exception as e:
-        # 统一处理所有异常，确保资源释放
         print(f"❌ 处理中断：{str(e)}")
         if conn:
             try:
@@ -127,10 +139,9 @@ def get_multiple_result_sets(strSp, strParam):
                 print("ℹ️  事务已回滚")
             except:
                 pass
-        raise  # 向上层传递错误，便于接口返回
+        raise
 
     finally:
-        # 确保游标和连接关闭
         if cursor:
             try:
                 cursor.close()
@@ -145,7 +156,7 @@ def get_multiple_result_sets(strSp, strParam):
                 pass
 
 
-# 接口定义（保留完整功能，错误返回更详细）
+# 接口定义
 @app.route('/users', methods=['GET', 'POST'])
 def get_users():
     try:
@@ -169,9 +180,9 @@ def get_users():
     except Exception as e:
         return jsonify({
             'success': False,
-            'message': str(e),  # 包含详细错误原因
+            'message': str(e),
             'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'param1': param1,  # 附带请求参数，便于排查
+            'param1': param1,
             'param2': param2
         }), 500
 
@@ -220,7 +231,7 @@ def get_xml(encoding="utf-8"):
         print(f"\n【接口请求】/xmlService - param1: {param1}, param2: {param2}")
         result_data = get_multiple_result_sets(param1, param2)
 
-        # 生成XML响应
+        # 生成XML
         root = ET.Element("ResultSets")
         root.set("generated_time", datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
         root.set("total_sets", str(len(result_data)))
